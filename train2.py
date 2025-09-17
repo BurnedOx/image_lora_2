@@ -25,14 +25,10 @@ from transformers import (
     AutoTokenizer,
     BlipProcessor,
     BlipForConditionalGeneration,
-    T5Tokenizer,
-    FluxTransformer2DModel,
-    FluxPipeline,
 )
 from diffusers import FluxTransformer2DModel as DiffusersFluxTransformer2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers.training_utils import EMAModel, compute_snr
-from diffusers.utils import check_min_version, deprecate
+from diffusers.utils import check_min_version
 
 check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)

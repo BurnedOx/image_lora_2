@@ -29,6 +29,7 @@ from transformers import (
 from diffusers import FluxTransformer2DModel as DiffusersFluxTransformer2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.utils import check_min_version
+from peft import prepare_model_for_kbit_training
 
 check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)
@@ -168,8 +169,16 @@ def main():
 
     # Flux transformer
     transformer = DiffusersFluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=None
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        torch_dtype=torch.float16,
+        device_map="auto"          # keeps most layers on GPU, spills to CPU when needed
     )
+    transformer = prepare_model_for_kbit_training(transformer)
 
     # LoRA
     lora_config = LoraConfig(
@@ -235,7 +244,7 @@ def main():
         transformer.save_pretrained(args.output_dir)
         # also export safetensors
         from safetensors.torch import save_file
-        save_file(transformor.state_dict(), os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"))
+        save_file(transformer.state_dict(), os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"))
         logger.info(f"LoRA saved to {args.output_dir}")
 
     accelerator.end_training()

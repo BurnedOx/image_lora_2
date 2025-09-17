@@ -3,6 +3,7 @@ from diffusers import StableDiffusionPipeline, UNet2DConditionModel, Autoencoder
 from diffusers import DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 import os
+import json
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from datasets import Dataset
@@ -63,24 +64,45 @@ for name, param in unet.named_parameters():
 
 optimizer = torch.optim.AdamW(lora_params, lr=LEARNING_RATE)
 
-# Sample training data (replace with your actual images)
-def create_sample_dataset():
-    # This is a placeholder - replace with your actual image paths and captions
-    images = [np.random.rand(512, 512, 3) for _ in range(10)]  # Random images
-    captions = [f"{TRIGGER_WORD} example {i}" for i in range(10)]
+# Load training data from data folder
+def load_dataset_from_folder():
+    # Read metadata
+    metadata_path = os.path.join("data", "metadata.jsonl")
+    image_dir = os.path.join("data", "img")
+    
+    images = []
+    captions = []
+    
+    with open(metadata_path, "r") as f:
+        for line in f:
+            data = json.loads(line.strip())
+            file_name = data["file_name"]
+            caption = data["text"]
+            
+            # Load and preprocess image
+            image_path = os.path.join(image_dir, file_name)
+            try:
+                image = Image.open(image_path).convert("RGB")
+                # Resize and convert to numpy array
+                image = image.resize((RESOLUTION, RESOLUTION))
+                image = np.array(image) / 255.0  # Normalize to [0, 1]
+                images.append(image)
+                captions.append(caption)
+            except Exception as e:
+                print(f"Error loading image {image_path}: {e}")
     
     return Dataset.from_dict({
         "pixel_values": images,
         "input_ids": [tokenizer(
-            caption, 
-            padding="max_length", 
+            caption,
+            padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
             return_tensors="pt"
         ).input_ids[0] for caption in captions]
     })
 
-train_dataset = create_sample_dataset()
+train_dataset = load_dataset_from_folder()
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Prepare with accelerator

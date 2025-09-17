@@ -185,20 +185,3 @@ unet.save_pretrained(OUTPUT_DIR)
 
 print(f"Training complete! LoRA weights saved to {OUTPUT_DIR}")
 print(f"Use trigger word: '{TRIGGER_WORD}' when generating images")
-
-# Test generation function
-def generate_test_image(prompt):
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-    ).to("cuda")
-    
-    # Load LoRA weights (you'd need proper LoRA integration)
-    # This is simplified - actual implementation would merge weights
-    
-    image = pipe(f"{TRIGGER_WORD} {prompt}").images[0]
-    image.save("./test_output.png")
-    return image
-
-# Uncomment to test after training
-# generate_test_image("a beautiful landscape")

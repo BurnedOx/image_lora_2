@@ -56,7 +56,7 @@ def load_dataset_from_folder():
     image_dir = os.path.join("data", "img")
     
     images = []
-    captions = []
+    input_ids_list = []
     
     with open(metadata_path, "r") as f:
         for line in f:
@@ -76,23 +76,46 @@ def load_dataset_from_folder():
                 # Normalize to [-1, 1] range expected by VAE
                 image = (image - 0.5) * 2.0
                 images.append(image)
-                captions.append(caption)
+                
+                # Tokenize caption and ensure it's a tensor
+                tokenized = tokenizer(
+                    caption,
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                )
+                input_ids = tokenized.input_ids[0]
+                if not isinstance(input_ids, torch.Tensor):
+                    input_ids = torch.tensor(input_ids)
+                input_ids_list.append(input_ids)
             except Exception as e:
                 print(f"Error loading image {image_path}: {e}")
     
-    return Dataset.from_dict({
-        "pixel_values": images,
-        "input_ids": [tokenizer(
-            caption,
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt"
-        ).input_ids[0] for caption in captions]
-    })
+    # Create a list of examples
+    data = []
+    for i in range(len(images)):
+        data.append({
+            "pixel_values": images[i],
+            "input_ids": input_ids_list[i]
+        })
+    return Dataset.from_list(data)
+
+def collate_fn(batch):
+    pixel_values = [item["pixel_values"] for item in batch]
+    input_ids = [item["input_ids"] for item in batch]
+    
+    # Stack tensors
+    pixel_values = torch.stack(pixel_values)
+    input_ids = torch.stack(input_ids)
+    
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids
+    }
 
 train_dataset = load_dataset_from_folder()
-train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 # Prepare with accelerator
 unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
@@ -106,9 +129,9 @@ for epoch in range(NUM_EPOCHS):
     train_loss = 0.0
     
     for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}")):
-        # Stack the list of tensors into a batch tensor
-        pixel_values = torch.stack(batch["pixel_values"]).to(accelerator.device)
-        input_ids = torch.stack(batch["input_ids"]).to(accelerator.device)
+        # Move batch to device (tensors are already stacked by collate_fn)
+        pixel_values = batch["pixel_values"].to(accelerator.device)
+        input_ids = batch["input_ids"].to(accelerator.device)
         
         # Convert images to latent space
         with torch.no_grad():

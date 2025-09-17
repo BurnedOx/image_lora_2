@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fine-tune Flux with LoRA on your own images.
+QLoRA fine-tune Flux-dev on your own images.
 Trigger word (token) is injected into every caption.
-Tested with diffusers >= 0.30 (Flux branch).
+~9 GB VRAM on a 16 GB card.
 """
 
 import argparse
@@ -18,17 +18,17 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from datasets import load_dataset
 from huggingface_hub import HfFolder
-from peft import LoraConfig, get_peft_model, get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, TaskType
 from PIL import Image
 from torchvision import transforms
-from transformers import (
-    AutoTokenizer,
-    BlipProcessor,
-    BlipForConditionalGeneration,
+from transformers import AutoTokenizer
+from diffusers import (
+    FluxTransformer2DModel,
+    FluxPipeline,
+    FluxScheduler,
 )
-from diffusers import FluxTransformer2DModel as DiffusersFluxTransformer2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers.utils import check_min_version
+from diffusers.utils import check_min_version, deprecate
 
 check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)
@@ -53,15 +53,10 @@ def tokenize_prompt(tokenizer, prompt, max_length=77):
         truncation=True,
         return_tensors="pt",
     )
-    return text_inputs.input_ids, text_inputs.attention_mask
+    return text_inputs.input_ids
 
 
 class DreamBoothDataset(torch.utils.data.Dataset):
-    """
-    If .txt sidecars exist we use them, otherwise we auto-caption with BLIP
-    and append the trigger word.
-    """
-
     def __init__(
         self,
         instance_data_root: str,
@@ -69,13 +64,11 @@ class DreamBoothDataset(torch.utils.data.Dataset):
         tokenizer,
         size: int = 512,
         center_crop=True,
-        auto_caption: bool = True,
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
-        self.instance_prompt = instance_prompt  # trigger word
-        self.auto_caption = auto_caption
+        self.instance_prompt = instance_prompt
 
         self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.instance_images_path = [
@@ -86,18 +79,10 @@ class DreamBoothDataset(torch.utils.data.Dataset):
 
         self.image_transforms = image_transforms(size, center_crop)
 
-        # BLIP for auto-caption
-        if self.auto_caption:
-            self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            self.caption_model = BlipForConditionalGeneration.from_pretrained(
-                "Salesforce/blip-image-captioning-base"
-            ).to("cuda" if torch.cuda.is_available() else "cpu")
-
     def __len__(self):
         return len(self.instance_images_path)
 
     def __getitem__(self, index):
-        example = {}
         image_path = self.instance_images_path[index]
         image = Image.open(image_path).convert("RGB")
 
@@ -106,22 +91,17 @@ class DreamBoothDataset(torch.utils.data.Dataset):
         if txt_path.exists():
             caption = txt_path.read_text(encoding="utf-8").strip()
         else:
-            if self.auto_caption:
-                inputs = self.caption_processor(image, return_tensors="pt").to(self.caption_model.device)
-                with torch.no_grad():
-                    out = self.caption_model.generate(**inputs, max_new_tokens=32)
-                caption = self.caption_processor.decode(out[0], skip_special_tokens=True).strip()
-            else:
-                caption = ""
-        # append trigger
+            caption = "a photo of mamaplugxs"
         caption = f"{caption.strip()}, {self.instance_prompt}"
-        example["input_ids"], example["attention_mask"] = tokenize_prompt(self.tokenizer, caption)
+
+        example = {}
+        example["input_ids"] = tokenize_prompt(self.tokenizer, caption).squeeze(0)
         example["pixel_values"] = self.image_transforms(image)
         return example
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simple Flux LoRA fine-tuning.")
+    parser = argparse.ArgumentParser(description="QLoRA Flux-dev fine-tuning.")
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--instance_data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="flux-lora")
@@ -136,8 +116,6 @@ def parse_args():
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--checkpointing_steps", type=int, default=100)
-    parser.add_argument("--validation_prompt", type=str, default=None)
-    parser.add_argument("--num_validation_images", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     return parser.parse_args()
@@ -151,14 +129,16 @@ def main():
         log_with="tensorboard",
         project_config=ProjectConfiguration(project_dir=args.output_dir),
     )
-
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", revision=None)
+    weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
 
-    # Dataset
+    # tokenizers
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    tokenizer_2 = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
+
+    # dataset
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
@@ -166,32 +146,40 @@ def main():
         size=args.resolution,
     )
 
-    # Flux transformer
-    transformer = DiffusersFluxTransformer2DModel.from_pretrained(
+    # 4-bit transformer
+    transformer = FluxTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=weight_dtype,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        torch_dtype=torch.float16,
-        device_map="auto"          # keeps most layers on GPU, spills to CPU when needed
+        torch_dtype=weight_dtype,
+        device_map="auto",
     )
-    # transformer = prepare_model_for_kbit_training(transformer)
 
-    # LoRA
+    # QLoRA
     lora_config = LoraConfig(
         r=16,
         lora_alpha=16,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        # important: tell PEFT this is a diffusion model
         task_type=TaskType.FEATURE_EXTRACTION,
     )
     transformer = get_peft_model(transformer, lora_config)
     transformer.print_trainable_parameters()
 
-    # Optimizer & scheduler
+    # text encoders & vae & scheduler (frozen)
+    pipe = FluxPipeline.from_pretrained(args.pretrained_model_name_or_path, torch_dtype=weight_dtype)
+    text_encoder = pipe.text_encoder
+    text_encoder_2 = pipe.text_encoder_2
+    vae = pipe.vae
+    noise_scheduler = pipe.scheduler
+    text_encoder.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
+    vae.requires_grad_(False)
+
+    # optimizer & scheduler
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=args.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
@@ -199,27 +187,60 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    # DataLoader
+    # dataloader
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
+        drop_last=True,
     )
 
-    # Prep
+    # prepare
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, train_dataloader, lr_scheduler
     )
 
-    # Train
+    # encode prompt helper
+    def encode_prompt(input_ids):
+        t5_out = text_encoder(input_ids.to(text_encoder.device), return_dict=False)[0]
+        clip_out = text_encoder_2(input_ids.to(text_encoder_2.device), return_dict=False)[0]
+        pooled = clip_out[0]
+        return t5_out, pooled
+
+    # train
     global_step = 0
     for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             transformer.train()
-            pixel_values = batch["pixel_values"].to(accelerator.device, dtype=accelerator.unwrap_model(transformer).dtype)
-            model_pred = transformer(pixel_values)
-            loss = F.mse_loss(model_pred, pixel_values, reduction="mean")
+            pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+
+            # 1. encode to latents
+            with torch.no_grad():
+                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+            # 2. noise & timesteps
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # 3. text embeds
+            prompt_embeds, pooled_prompt_embeds = encode_prompt(batch["input_ids"])
+
+            # 4. predict noise
+            model_pred = transformer(
+                hidden_states=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                return_dict=False,
+            )[0]
+
+            # 5. loss
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(transformer.parameters(), 1.0)
@@ -233,17 +254,17 @@ def main():
             if global_step % args.checkpointing_steps == 0:
                 if accelerator.is_main_process:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    accelerator.unwrap_model(transformer).save_pretrained(save_path)
+                    transformer.save_pretrained(save_path)
 
             if global_step >= args.max_train_steps:
                 break
 
-    # Save final LoRA
+    # final save
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         transformer = accelerator.unwrap_model(transformer)
         transformer.save_pretrained(args.output_dir)
-        # also export safetensors
+        # safetensors too
         from safetensors.torch import save_file
         save_file(transformer.state_dict(), os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"))
         logger.info(f"LoRA saved to {args.output_dir}")

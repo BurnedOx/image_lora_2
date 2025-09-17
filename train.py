@@ -35,34 +35,19 @@ noise_scheduler = DDPMScheduler.from_pretrained(MODEL_NAME, subfolder="scheduler
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
 
-# Add LoRA layers to UNet (simplified implementation)
-def add_lora_layers(unet):
-    for name, module in unet.named_modules():
-        if "proj" in name or "to" in name and hasattr(module, "weight"):
-            # Add LoRA layers here (simplified)
-            module.lora_down = torch.nn.Linear(module.in_features, 4, bias=False)
-            module.lora_up = torch.nn.Linear(4, module.out_features, bias=False)
-            module.original_forward = module.forward
-            
-            def lora_forward(x):
-                original_output = module.original_forward(x)
-                lora_output = module.lora_up(module.lora_down(x))
-                return original_output + lora_output
-                
-            module.forward = lora_forward
+# Add LoRA layers to UNet using PEFT library
+from peft import LoraConfig, get_peft_model
 
-add_lora_layers(unet)
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+    lora_dropout=0.1,
+)
+unet = get_peft_model(unet, lora_config)
 
 # Prepare optimizer (only train LoRA parameters)
-lora_params = []
-for name, param in unet.named_parameters():
-    if "lora" in name:
-        param.requires_grad = True
-        lora_params.append(param)
-    else:
-        param.requires_grad = False
-
-optimizer = torch.optim.AdamW(lora_params, lr=LEARNING_RATE)
+optimizer = torch.optim.AdamW(unet.parameters(), lr=LEARNING_RATE)
 
 # Load training data from data folder
 def load_dataset_from_folder():
@@ -145,16 +130,12 @@ for epoch in range(NUM_EPOCHS):
 
     print(f"Epoch {epoch} - Average Loss: {train_loss / len(train_dataloader):.4f}")
 
-# Save LoRA weights
+# Save LoRA weights using PEFT
 print("Saving model...")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-lora_state_dict = {}
-for name, param in unet.named_parameters():
-    if "lora" in name:
-        lora_state_dict[name] = param.cpu()
-
-torch.save(lora_state_dict, os.path.join(OUTPUT_DIR, "lora_weights.pth"))
+# Save the entire PEFT model (includes LoRA weights and adapter config)
+unet.save_pretrained(OUTPUT_DIR)
 
 print(f"Training complete! LoRA weights saved to {OUTPUT_DIR}")
 print(f"Use trigger word: '{TRIGGER_WORD}' when generating images")

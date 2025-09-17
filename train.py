@@ -68,9 +68,13 @@ def load_dataset_from_folder():
             image_path = os.path.join(image_dir, file_name)
             try:
                 image = Image.open(image_path).convert("RGB")
-                # Resize and convert to numpy array
+                # Resize and convert to tensor
                 image = image.resize((RESOLUTION, RESOLUTION))
                 image = np.array(image) / 255.0  # Normalize to [0, 1]
+                # Convert to tensor and change to channel-first format
+                image = torch.from_numpy(image).permute(2, 0, 1).float()
+                # Normalize to [-1, 1] range expected by VAE
+                image = (image - 0.5) * 2.0
                 images.append(image)
                 captions.append(caption)
             except Exception as e:
@@ -102,9 +106,13 @@ for epoch in range(NUM_EPOCHS):
     train_loss = 0.0
     
     for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}")):
+        # Stack the list of tensors into a batch tensor
+        pixel_values = torch.stack(batch["pixel_values"]).to(accelerator.device)
+        input_ids = torch.stack(batch["input_ids"]).to(accelerator.device)
+        
         # Convert images to latent space
         with torch.no_grad():
-            latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latent_dist.sample()
+            latents = vae.encode(pixel_values).latent_dist.sample()
             latents = latents * 0.18215
 
         # Sample noise
@@ -113,7 +121,7 @@ for epoch in range(NUM_EPOCHS):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
         # Get text embeddings
-        encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
+        encoder_hidden_states = text_encoder(input_ids)[0]
 
         # Predict noise
         noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample

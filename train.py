@@ -11,7 +11,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 # Configuration
-MODEL_NAME = "runwayml/stable-diffusion-v1-5"
+MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
 BATCH_SIZE = 1
@@ -158,11 +158,27 @@ for epoch in range(NUM_EPOCHS):
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (BATCH_SIZE,), device=latents.device)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Get text embeddings
-        encoder_hidden_states = text_encoder(input_ids)[0]
+        # Get text embeddings for SDXL (both hidden states and pooled output)
+        text_encoder_output = text_encoder(input_ids)
+        encoder_hidden_states = text_encoder_output[0]
+        pooled_text_embeds = text_encoder_output.pooler_output if hasattr(text_encoder_output, 'pooler_output') else text_encoder_output[0][:, :1, :]
 
-        # Predict noise
-        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        # Create added_cond_kwargs for SDXL
+        add_time_ids = torch.tensor([RESOLUTION, RESOLUTION, 0, 0, RESOLUTION, RESOLUTION], device=latents.device)
+        add_time_ids = add_time_ids.repeat(BATCH_SIZE, 1)
+        
+        added_cond_kwargs = {
+            "text_embeds": pooled_text_embeds,
+            "time_ids": add_time_ids
+        }
+
+        # Predict noise with SDXL-specific arguments
+        noise_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states,
+            added_cond_kwargs=added_cond_kwargs
+        ).sample
 
         # Calculate loss
         loss = torch.nn.functional.mse_loss(noise_pred, noise)

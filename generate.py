@@ -4,7 +4,7 @@ from peft import PeftModel
 import os
 
 # Configuration
-MODEL_NAME = "runwayml/stable-diffusion-v1-5"
+MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
 LORA_PATH = "./lora_finetuned_model"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_IMAGE_PATH = "./generated_image.png"

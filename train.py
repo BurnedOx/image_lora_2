@@ -15,7 +15,7 @@ MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
 BATCH_SIZE = 1
-NUM_EPOCHS = 10
+NUM_EPOCHS = 100
 LEARNING_RATE = 1e-4
 RESOLUTION = 512
 

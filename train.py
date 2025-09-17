@@ -7,6 +7,7 @@ Trigger word: mamaplugxs
 
 import os
 import json
+import gc
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -73,28 +74,32 @@ def load_dataset(data_root: str):
 # 3. Build models with proper initialization
 # ------------------------------------------------------------------
 def build_models():
-    # Load VAE for image encoding
+    # Load VAE for image encoding with memory optimization
     vae = AutoencoderKL.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         subfolder="vae",
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
+        device_map="auto"
     )
     
-    # Load Flux transformer with memory optimization
+    # Load Flux transformer with extreme memory optimization
     transformer = FluxTransformer2DModel.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         subfolder="transformer",
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        use_safetensors=True
+        use_safetensors=True,
+        device_map="auto",
+        max_memory={0: "14GB"}  # Limit GPU memory usage
     )
     
-    # Load text encoder
+    # Load text encoder with memory optimization
     text_encoder = CLIPTextModel.from_pretrained(
         "openai/clip-vit-large-patch14",
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
+        device_map="auto"
     )
     
     # Load scheduler
@@ -139,7 +144,19 @@ def main():
     
     # Enable gradient checkpointing and add LoRA
     transformer.enable_gradient_checkpointing()
+    try:
+        transformer.enable_xformers_memory_efficient_attention()
+    except:
+        print("xformers not available, using standard attention")
     transformer = add_lora(transformer)
+    
+    # Freeze all original parameters except LoRA
+    for name, param in transformer.named_parameters():
+        if "lora" not in name:
+            param.requires_grad = False
+    
+    # Enable mixed precision training for memory efficiency
+    torch.cuda.empty_cache()
     
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -178,6 +195,15 @@ def main():
     vae.requires_grad_(False)
     vae.eval()
     
+    # Enable CPU offload for VAE and text encoder to save GPU memory
+    if hasattr(vae, 'enable_cpu_offload'):
+        vae.enable_cpu_offload()
+    if hasattr(text_encoder, 'enable_cpu_offload'):
+        text_encoder.enable_cpu_offload()
+    
+    # Enable sequential CPU offload for transformer
+    transformer.enable_model_cpu_offload()
+    
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )
@@ -200,6 +226,9 @@ def main():
                     break
                     
                 try:
+                    # Clear cache before each batch
+                    torch.cuda.empty_cache()
+                    
                     # Get batch data
                     images = batch["pixel_values"].to(accelerator.device, dtype=torch.float16)
                     captions = batch["input_ids"]
@@ -220,9 +249,10 @@ def main():
                     # Sample noise and timesteps
                     noise = torch.randn_like(images)
                     
-                    # Encode images to latents
-                    latents = vae.encode(images).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
+                    # Encode images to latents with memory cleanup
+                    with torch.no_grad():
+                        latents = vae.encode(images).latent_dist.sample()
+                        latents = latents * vae.config.scaling_factor
                     
                     timesteps = torch.randint(
                         0, scheduler.config.num_train_timesteps,
@@ -271,9 +301,14 @@ def main():
                             save_path = f"{OUTPUT_DIR}/checkpoint-{global_step}"
                             transformer.save_pretrained(save_path, safe_serialization=True)
                             print(f"\nCheckpoint saved at step {global_step}")
+                    
+                    # Clean up after each batch
+                    del images, latents, noisy_latents, noise, model_pred
+                    torch.cuda.empty_cache()
                             
                 except Exception as e:
                     print(f"Error processing batch: {e}")
+                    torch.cuda.empty_cache()
                     continue
     
     except KeyboardInterrupt:

@@ -131,6 +131,9 @@ train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True
 
 # Prepare with accelerator
 unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
+# Move VAE and text_encoder to accelerator device
+vae.to(accelerator.device)
+text_encoder.to(accelerator.device)
 
 # Training loop
 print("Starting training...")

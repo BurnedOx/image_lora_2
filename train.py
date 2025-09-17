@@ -15,7 +15,7 @@ MODEL_NAME = "runwayml/stable-diffusion-v1-5"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
 BATCH_SIZE = 1
-NUM_EPOCHS = 10
+NUM_EPOCHS = 1000
 LEARNING_RATE = 1e-4
 RESOLUTION = 512
 

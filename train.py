@@ -1,318 +1,155 @@
-#!/usr/bin/env python3
-"""
-Flux-1-Dev LoRA Fine-tuning Script
-Optimized for RTX 4060 with 20GB RAM
-Trigger word: mamaplugxs
-"""
-
-import os
-import json
-import gc
 import torch
-import torch.nn.functional as F
-from pathlib import Path
-from datasets import Dataset
-from diffusers import FluxTransformer2DModel, DDPMScheduler, AutoencoderKL
-from transformers import CLIPTokenizer, CLIPTextModel
-from peft import LoraConfig, get_peft_model
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL
+from diffusers import DDPMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
+import os
 from accelerate import Accelerator
-from torchvision import transforms
+from torch.utils.data import DataLoader
+from datasets import Dataset
 from PIL import Image
+import numpy as np
 from tqdm.auto import tqdm
 
-# ------------------------------------------------------------------
-# 1. Hyper-parameters optimized for RTX 4060
-# ------------------------------------------------------------------
-RESOLUTION = 512
-RANK = 8  # Higher rank for better quality on RTX 4060
-ALPHA = 16
-LR = 1e-4
-BATCH_SIZE = 1
-GRAD_ACC = 8  # Increased for better memory management
-MAX_STEPS = 10  # More steps for better convergence
-SAVE_STEPS = 1
-WARMUP_STEPS = 1
-OUTPUT_DIR = "flux_lora_mamaplugxs"
-DATA_ROOT = "data"
+# Configuration
+MODEL_NAME = "runwayml/stable-diffusion-v1-5"
 TRIGGER_WORD = "mamaplugxs"
+OUTPUT_DIR = "./lora_finetuned_model"
+BATCH_SIZE = 1
+NUM_EPOCHS = 10
+LEARNING_RATE = 1e-4
+RESOLUTION = 512
 
-# ------------------------------------------------------------------
-# 2. Dataset loader with trigger word
-# ------------------------------------------------------------------
-def load_dataset(data_root: str):
-    metadata_file = Path(data_root) / "metadata.jsonl"
-    if not metadata_file.exists():
-        raise FileNotFoundError("Create data/metadata.jsonl with {'file_name': '1.jpg', 'text': 'your caption'}")
+# Initialize accelerator
+accelerator = Accelerator()
 
-    samples = []
-    with open(metadata_file) as f:
-        for line in f:
-            samples.append(json.loads(line))
+# Load models and components
+print("Loading models...")
+tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME, subfolder="tokenizer")
+text_encoder = CLIPTextModel.from_pretrained(MODEL_NAME, subfolder="text_encoder")
+vae = AutoencoderKL.from_pretrained(MODEL_NAME, subfolder="vae")
+unet = UNet2DConditionModel.from_pretrained(MODEL_NAME, subfolder="unet")
+noise_scheduler = DDPMScheduler.from_pretrained(MODEL_NAME, subfolder="scheduler")
 
-    # Image transformations
-    transform_img = transforms.Compose([
-        transforms.Resize(RESOLUTION),
-        transforms.CenterCrop(RESOLUTION),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
-    ])
+# Freeze models except for LoRA parameters
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
 
-    def transform(ex):
-        img_path = Path(data_root) / "img" / ex["file_name"]
-        image = Image.open(img_path).convert("RGB")
-        image = transform_img(image)
-        ex["pixel_values"] = image
-        ex["input_ids"] = f"{TRIGGER_WORD} {ex['text']}"
-        return ex
+# Add LoRA layers to UNet (simplified implementation)
+def add_lora_layers(unet):
+    for name, module in unet.named_modules():
+        if "proj" in name or "to" in name and hasattr(module, "weight"):
+            # Add LoRA layers here (simplified)
+            module.lora_down = torch.nn.Linear(module.in_features, 4, bias=False)
+            module.lora_up = torch.nn.Linear(4, module.out_features, bias=False)
+            module.original_forward = module.forward
+            
+            def lora_forward(x):
+                original_output = module.original_forward(x)
+                lora_output = module.lora_up(module.lora_down(x))
+                return original_output + lora_output
+                
+            module.forward = lora_forward
 
-    ds = Dataset.from_list(samples)
-    ds = ds.map(transform, remove_columns=["file_name"])
-    ds = ds.with_format("torch")
-    return ds
+add_lora_layers(unet)
 
-# ------------------------------------------------------------------
-# 3. Build models with proper initialization
-# ------------------------------------------------------------------
-def build_models():
-    # Load VAE for image encoding with memory optimization
-    vae = AutoencoderKL.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        subfolder="vae",
+# Prepare optimizer (only train LoRA parameters)
+lora_params = []
+for name, param in unet.named_parameters():
+    if "lora" in name:
+        param.requires_grad = True
+        lora_params.append(param)
+    else:
+        param.requires_grad = False
+
+optimizer = torch.optim.AdamW(lora_params, lr=LEARNING_RATE)
+
+# Sample training data (replace with your actual images)
+def create_sample_dataset():
+    # This is a placeholder - replace with your actual image paths and captions
+    images = [np.random.rand(512, 512, 3) for _ in range(10)]  # Random images
+    captions = [f"{TRIGGER_WORD} example {i}" for i in range(10)]
+    
+    return Dataset.from_dict({
+        "pixel_values": images,
+        "input_ids": [tokenizer(
+            caption, 
+            padding="max_length", 
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids[0] for caption in captions]
+    })
+
+train_dataset = create_sample_dataset()
+train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# Prepare with accelerator
+unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
+
+# Training loop
+print("Starting training...")
+global_step = 0
+
+for epoch in range(NUM_EPOCHS):
+    unet.train()
+    train_loss = 0.0
+    
+    for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}")):
+        # Convert images to latent space
+        with torch.no_grad():
+            latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latent_dist.sample()
+            latents = latents * 0.18215
+
+        # Sample noise
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (BATCH_SIZE,), device=latents.device)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get text embeddings
+        encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
+
+        # Predict noise
+        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        # Calculate loss
+        loss = torch.nn.functional.mse_loss(noise_pred, noise)
+        accelerator.backward(loss)
+        
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        train_loss += loss.item()
+        global_step += 1
+
+    print(f"Epoch {epoch} - Average Loss: {train_loss / len(train_dataloader):.4f}")
+
+# Save LoRA weights
+print("Saving model...")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+lora_state_dict = {}
+for name, param in unet.named_parameters():
+    if "lora" in name:
+        lora_state_dict[name] = param.cpu()
+
+torch.save(lora_state_dict, os.path.join(OUTPUT_DIR, "lora_weights.pth"))
+
+print(f"Training complete! LoRA weights saved to {OUTPUT_DIR}")
+print(f"Use trigger word: '{TRIGGER_WORD}' when generating images")
+
+# Test generation function
+def generate_test_image(prompt):
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_NAME,
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True
-    )
+    ).to("cuda")
     
-    # Load Flux transformer with extreme memory optimization
-    transformer = FluxTransformer2DModel.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        subfolder="transformer",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        use_safetensors=True
-    )
+    # Load LoRA weights (you'd need proper LoRA integration)
+    # This is simplified - actual implementation would merge weights
     
-    # Load text encoder with memory optimization
-    text_encoder = CLIPTextModel.from_pretrained(
-        "openai/clip-vit-large-patch14",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True
-    )
-    
-    # Load scheduler
-    scheduler = DDPMScheduler.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        subfolder="scheduler"
-    )
-    
-    return vae, text_encoder, transformer, scheduler
+    image = pipe(f"{TRIGGER_WORD} {prompt}").images[0]
+    image.save("./test_output.png")
+    return image
 
-# ------------------------------------------------------------------
-# 4. Add LoRA with optimized configuration
-# ------------------------------------------------------------------
-def add_lora(transformer):
-    lora_conf = LoraConfig(
-        r=RANK,
-        lora_alpha=ALPHA,
-        target_modules=[
-            "to_q", "to_k", "to_v", "to_out.0",
-            "ff.net.0.proj", "ff.net.2"
-        ],
-        lora_dropout=0.1,
-        bias="none",
-    )
-    transformer = get_peft_model(transformer, lora_conf)
-    transformer.print_trainable_parameters()
-    return transformer
-
-# ------------------------------------------------------------------
-# 5. Training loop with proper diffusion process
-# ------------------------------------------------------------------
-def main():
-    accelerator = Accelerator(
-        gradient_accumulation_steps=GRAD_ACC,
-        mixed_precision="fp16"
-    )
-    
-    # Load components
-    dataset = load_dataset(DATA_ROOT)
-    vae, text_encoder, transformer, scheduler = build_models()
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    
-    # Enable gradient checkpointing and add LoRA
-    transformer.enable_gradient_checkpointing()
-    try:
-        transformer.enable_xformers_memory_efficient_attention()
-    except:
-        print("xformers not available, using standard attention")
-    transformer = add_lora(transformer)
-    
-    # Freeze all original parameters except LoRA
-    for name, param in transformer.named_parameters():
-        if "lora" not in name:
-            param.requires_grad = False
-    
-    # Enable mixed precision training for memory efficiency
-    torch.cuda.empty_cache()
-    
-    # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(
-        transformer.parameters(), 
-        lr=LR,
-        weight_decay=1e-2
-    )
-    
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=MAX_STEPS - WARMUP_STEPS
-    )
-    
-    # Data loader - optimized for RTX 4060
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        num_workers=0,
-        pin_memory=True
-    )
-    
-    # Training info
-    print(f"Dataset size: {len(dataset)}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Gradient accumulation steps: {GRAD_ACC}")
-    print(f"Total training steps: {MAX_STEPS}")
-    print("Starting training...")
-    
-    # Prepare models with accelerator - optimize for RTX 4060 memory
-    text_encoder = text_encoder.to(accelerator.device)
-    text_encoder.requires_grad_(False)
-    text_encoder.eval()
-    vae = vae.to(accelerator.device)
-    vae.requires_grad_(False)
-    vae.eval()
-    
-    # Enable CPU offload for VAE and text encoder to save GPU memory
-    if hasattr(vae, 'enable_cpu_offload'):
-        vae.enable_cpu_offload()
-    if hasattr(text_encoder, 'enable_cpu_offload'):
-        text_encoder.enable_cpu_offload()
-    
-    transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, dataloader, lr_scheduler
-    )
-    vae = accelerator.prepare(vae)
-    
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    global_step = 0
-    
-    # Progress bar
-    progress_bar = tqdm(range(MAX_STEPS), disable=not accelerator.is_main_process)
-    progress_bar.set_description("Training Progress")
-    
-    # Training loop with better error handling and progress tracking
-    transformer.train()
-    try:
-        for epoch in range(MAX_STEPS // len(dataloader) + 1):
-            for batch in dataloader:
-                if global_step >= MAX_STEPS:
-                    break
-                    
-                try:
-                    # Clear cache before each batch
-                    torch.cuda.empty_cache()
-                    
-                    # Get batch data
-                    images = batch["pixel_values"].to(accelerator.device, dtype=torch.float16)
-                    captions = batch["input_ids"]
-                    
-                    # Tokenize captions
-                    text_inputs = tokenizer(
-                        captions,
-                        max_length=77,
-                        padding="max_length",
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to(accelerator.device)
-                    
-                    # Get text embeddings
-                    with torch.no_grad():
-                        prompt_embeds = text_encoder(text_inputs.input_ids)[0]
-                    
-                    # Sample noise and timesteps
-                    noise = torch.randn_like(images)
-                    
-                    # Encode images to latents with memory cleanup
-                    with torch.no_grad():
-                        latents = vae.encode(images).latent_dist.sample()
-                        latents = latents * vae.config.scaling_factor
-                    
-                    timesteps = torch.randint(
-                        0, scheduler.config.num_train_timesteps,
-                        (images.shape[0],),
-                        device=images.device
-                    ).long()
-                    
-                    # Add noise to latents
-                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                    
-                    # Predict noise
-                    with accelerator.accumulate(transformer):
-                        # Reshape latents for transformer input
-                        batch_size, channels, height, width = noisy_latents.shape
-                        noisy_latents_reshaped = noisy_latents.permute(0, 2, 3, 1).reshape(batch_size, height * width, channels)
-                        
-                        model_pred = transformer(
-                            hidden_states=noisy_latents_reshaped,
-                            encoder_hidden_states=prompt_embeds,
-                            timestep=timesteps
-                        ).sample
-                        
-                        # Reshape prediction back to image dimensions
-                        model_pred = model_pred.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
-                        
-                        # Calculate loss
-                        loss = F.mse_loss(model_pred, noise, reduction="mean")
-                        
-                        # Backward pass
-                        accelerator.backward(loss)
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad()
-                    
-                    # Update progress
-                    global_step += 1
-                    if accelerator.is_main_process:
-                        progress_bar.update(1)
-                        progress_bar.set_postfix({
-                            "loss": f"{loss.item():.4f}",
-                            "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"
-                        })
-                        
-                        # Save checkpoint
-                        if global_step % SAVE_STEPS == 0:
-                            save_path = f"{OUTPUT_DIR}/checkpoint-{global_step}"
-                            transformer.save_pretrained(save_path, safe_serialization=True)
-                            print(f"\nCheckpoint saved at step {global_step}")
-                    
-                    # Clean up after each batch
-                    del images, latents, noisy_latents, noise, model_pred
-                    torch.cuda.empty_cache()
-                            
-                except Exception as e:
-                    print(f"Error processing batch: {e}")
-                    torch.cuda.empty_cache()
-                    continue
-    
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
-    except Exception as e:
-        print(f"Training failed with error: {e}")
-        raise
-    
-    # Final save
-    transformer.save_pretrained(OUTPUT_DIR, safe_serialization=True)
-    print(f"\nTraining complete! LoRA saved to {OUTPUT_DIR}")
-
-if __name__ == "__main__":
-    main()
+# Uncomment to test after training
+# generate_test_image("a beautiful landscape")

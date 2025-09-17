@@ -5,8 +5,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 import os
 import json
 from accelerate import Accelerator
-from torch.utils.data import DataLoader
-from datasets import Dataset
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import numpy as np
 from tqdm.auto import tqdm
@@ -49,57 +48,71 @@ unet = get_peft_model(unet, lora_config)
 # Prepare optimizer (only train LoRA parameters)
 optimizer = torch.optim.AdamW(unet.parameters(), lr=LEARNING_RATE)
 
-# Load training data from data folder
-def load_dataset_from_folder():
-    # Read metadata
-    metadata_path = os.path.join("data", "metadata.jsonl")
-    image_dir = os.path.join("data", "img")
+# Custom PyTorch Dataset class
+class ImageCaptionDataset(Dataset):
+    def __init__(self, metadata_path, image_dir, tokenizer, resolution=512):
+        self.metadata_path = metadata_path
+        self.image_dir = image_dir
+        self.tokenizer = tokenizer
+        self.resolution = resolution
+        
+        # Load metadata
+        self.data = []
+        with open(metadata_path, "r") as f:
+            for line in f:
+                self.data.append(json.loads(line.strip()))
     
-    images = []
-    input_ids_list = []
+    def __len__(self):
+        return len(self.data)
     
-    with open(metadata_path, "r") as f:
-        for line in f:
-            data = json.loads(line.strip())
-            file_name = data["file_name"]
-            caption = data["text"]
-            
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        file_name = item["file_name"]
+        caption = item["text"]
+        
+        try:
             # Load and preprocess image
-            image_path = os.path.join(image_dir, file_name)
-            try:
-                image = Image.open(image_path).convert("RGB")
-                # Resize and convert to tensor
-                image = image.resize((RESOLUTION, RESOLUTION))
-                image = np.array(image) / 255.0  # Normalize to [0, 1]
-                # Convert to tensor and change to channel-first format
-                image = torch.from_numpy(image).permute(2, 0, 1).float()
-                # Normalize to [-1, 1] range expected by VAE
-                image = (image - 0.5) * 2.0
-                images.append(image)
-                
-                # Tokenize caption and ensure it's a tensor
-                tokenized = tokenizer(
-                    caption,
-                    padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                input_ids = tokenized.input_ids[0]
-                if not isinstance(input_ids, torch.Tensor):
-                    input_ids = torch.tensor(input_ids)
-                input_ids_list.append(input_ids)
-            except Exception as e:
-                print(f"Error loading image {image_path}: {e}")
-    
-    # Create a list of examples
-    data = []
-    for i in range(len(images)):
-        data.append({
-            "pixel_values": images[i],
-            "input_ids": input_ids_list[i]
-        })
-    return Dataset.from_list(data)
+            image_path = os.path.join(self.image_dir, file_name)
+            image = Image.open(image_path).convert("RGB")
+            # Resize and convert to tensor
+            image = image.resize((self.resolution, self.resolution))
+            image = np.array(image) / 255.0  # Normalize to [0, 1]
+            # Convert to tensor and change to channel-first format
+            image = torch.from_numpy(image).permute(2, 0, 1).float()
+            # Normalize to [-1, 1] range expected by VAE
+            image = (image - 0.5) * 2.0
+            
+            # Tokenize caption
+            tokenized = self.tokenizer(
+                caption,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            input_ids = tokenized.input_ids[0]
+            
+            return {
+                "pixel_values": image,
+                "input_ids": input_ids
+            }
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return a dummy tensor to avoid breaking the batch
+            dummy_image = torch.zeros((3, self.resolution, self.resolution))
+            dummy_input_ids = torch.zeros((self.tokenizer.model_max_length,), dtype=torch.long)
+            return {
+                "pixel_values": dummy_image,
+                "input_ids": dummy_input_ids
+            }
+
+# Load training data
+train_dataset = ImageCaptionDataset(
+    metadata_path=os.path.join("data", "metadata.jsonl"),
+    image_dir=os.path.join("data", "img"),
+    tokenizer=tokenizer,
+    resolution=RESOLUTION
+)
 
 def collate_fn(batch):
     pixel_values = [item["pixel_values"] for item in batch]
@@ -114,7 +127,6 @@ def collate_fn(batch):
         "input_ids": input_ids
     }
 
-train_dataset = load_dataset_from_folder()
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 # Prepare with accelerator

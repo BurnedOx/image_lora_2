@@ -79,8 +79,7 @@ def build_models():
         "black-forest-labs/FLUX.1-dev",
         subfolder="vae",
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="auto"
+        low_cpu_mem_usage=True
     )
     
     # Load Flux transformer with extreme memory optimization
@@ -89,17 +88,14 @@ def build_models():
         subfolder="transformer",
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        use_safetensors=True,
-        device_map="auto",
-        max_memory={0: "14GB"}  # Limit GPU memory usage
+        use_safetensors=True
     )
     
     # Load text encoder with memory optimization
     text_encoder = CLIPTextModel.from_pretrained(
         "openai/clip-vit-large-patch14",
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="auto"
+        low_cpu_mem_usage=True
     )
     
     # Load scheduler

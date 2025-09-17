@@ -197,9 +197,6 @@ def main():
     if hasattr(text_encoder, 'enable_cpu_offload'):
         text_encoder.enable_cpu_offload()
     
-    # Enable sequential CPU offload for transformer
-    transformer.enable_model_cpu_offload()
-    
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )

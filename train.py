@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-lora_flux1_dev_mamaplugxs_tqdm.py
-Fine-tune FLUX.1-dev with LoRA on 20 images on a Tesla T4.
+Flux-1-Dev LoRA Fine-tuning Script
+Optimized for RTX 4060 with 20GB RAM
 Trigger word: mamaplugxs
-Shows progress bars with tqdm
 """
 
-import os, json, torch
+import os
+import json
+import torch
+import torch.nn.functional as F
 from pathlib import Path
 from datasets import Dataset
-from diffusers import FluxPipeline, FluxTransformer2DModel
-from transformers import CLIPTokenizer
+from diffusers import FluxTransformer2DModel, DDPMScheduler
+from transformers import CLIPTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
 from accelerate import Accelerator
 from torchvision import transforms
@@ -18,22 +20,23 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 # ------------------------------------------------------------------
-# 1. Hyper-parameters
+# 1. Hyper-parameters optimized for RTX 4060
 # ------------------------------------------------------------------
-RESOLUTION      = 512
-RANK            = 4
-ALPHA           = 4
-LR              = 1e-4
-BATCH_SIZE      = 1
-GRAD_ACC        = 4
-MAX_STEPS       = 500
-SAVE_STEPS      = 100
-OUTPUT_DIR      = "flux_lora_mamaplugxs"
-DATA_ROOT       = "data"
-TRIGGER_WORD    = "mamaplugxs"
+RESOLUTION = 512
+RANK = 8  # Higher rank for better quality on RTX 4060
+ALPHA = 16
+LR = 1e-4
+BATCH_SIZE = 1
+GRAD_ACC = 8  # Increased for better memory management
+MAX_STEPS = 100  # More steps for better convergence
+SAVE_STEPS = 10
+WARMUP_STEPS = 10
+OUTPUT_DIR = "flux_lora_mamaplugxs"
+DATA_ROOT = "data"
+TRIGGER_WORD = "mamaplugxs"
 
 # ------------------------------------------------------------------
-# 2. Dataset loader (adds trigger word)
+# 2. Dataset loader with trigger word
 # ------------------------------------------------------------------
 def load_dataset(data_root: str):
     metadata_file = Path(data_root) / "metadata.jsonl"
@@ -45,12 +48,20 @@ def load_dataset(data_root: str):
         for line in f:
             samples.append(json.loads(line))
 
+    # Image transformations
+    transform_img = transforms.Compose([
+        transforms.Resize(RESOLUTION),
+        transforms.CenterCrop(RESOLUTION),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+
     def transform(ex):
         img_path = Path(data_root) / "img" / ex["file_name"]
         image = Image.open(img_path).convert("RGB")
-        image = transforms.CenterCrop(RESOLUTION)(transforms.Resize(RESOLUTION)(image))
-        ex["image"] = image
-        ex["text"] = f"{TRIGGER_WORD} {ex['text']}"
+        image = transform_img(image)
+        ex["pixel_values"] = image
+        ex["input_ids"] = f"{TRIGGER_WORD} {ex['text']}"
         return ex
 
     ds = Dataset.from_list(samples)
@@ -59,16 +70,35 @@ def load_dataset(data_root: str):
     return ds
 
 # ------------------------------------------------------------------
-# 3. Build models
+# 3. Build models with proper initialization
 # ------------------------------------------------------------------
 def build_models():
-    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16)
-    pipe.enable_sequential_cpu_offload()
-    transformer: FluxTransformer2DModel = pipe.transformer
-    return pipe, transformer
+    # Load Flux transformer with memory optimization
+    transformer = FluxTransformer2DModel.from_pretrained(
+        "black-forest-labs/FLUX.1-dev",
+        subfolder="transformer",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        use_safetensors=True
+    )
+    
+    # Load text encoder
+    text_encoder = CLIPTextModel.from_pretrained(
+        "openai/clip-vit-large-patch14",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
+    
+    # Load scheduler
+    scheduler = DDPMScheduler.from_pretrained(
+        "black-forest-labs/FLUX.1-dev",
+        subfolder="scheduler"
+    )
+    
+    return text_encoder, transformer, scheduler
 
 # ------------------------------------------------------------------
-# 4. Add LoRA
+# 4. Add LoRA with optimized configuration
 # ------------------------------------------------------------------
 def add_lora(transformer):
     lora_conf = LoraConfig(
@@ -78,7 +108,7 @@ def add_lora(transformer):
             "to_q", "to_k", "to_v", "to_out.0",
             "ff.net.0.proj", "ff.net.2"
         ],
-        lora_dropout=0.0,
+        lora_dropout=0.1,
         bias="none",
     )
     transformer = get_peft_model(transformer, lora_conf)
@@ -86,72 +116,131 @@ def add_lora(transformer):
     return transformer
 
 # ------------------------------------------------------------------
-# 5. Training with tqdm
+# 5. Training loop with proper diffusion process
 # ------------------------------------------------------------------
 def main():
-    accelerator = Accelerator(gradient_accumulation_steps=GRAD_ACC)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=GRAD_ACC,
+        mixed_precision="fp16"
+    )
+    
+    # Load components
     dataset = load_dataset(DATA_ROOT)
-    pipe, transformer = build_models()
+    text_encoder, transformer, scheduler = build_models()
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-
+    
+    # Enable gradient checkpointing and add LoRA
     transformer.enable_gradient_checkpointing()
     transformer = add_lora(transformer)
-    transformer.train().to(accelerator.device)
-
-    optimizer = torch.optim.AdamW(transformer.parameters(), lr=LR)
-    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True
+    
+    # Optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        transformer.parameters(), 
+        lr=LR,
+        weight_decay=1e-2
     )
-
+    
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=MAX_STEPS - WARMUP_STEPS
+    )
+    
+    # Data loader
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        drop_last=True,
+        num_workers=2
+    )
+    
+    # Prepare models with accelerator
+    text_encoder = text_encoder.to(accelerator.device)
+    text_encoder.requires_grad_(False)
+    text_encoder.eval()
+    
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )
-
+    
+    # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     global_step = 0
-
+    
+    # Progress bar
     progress_bar = tqdm(range(MAX_STEPS), disable=not accelerator.is_main_process)
-    progress_bar.set_description("Steps")
-
-    while global_step < MAX_STEPS:
+    progress_bar.set_description("Training Progress")
+    
+    # Training loop
+    transformer.train()
+    for epoch in range(MAX_STEPS // len(dataloader) + 1):
         for batch in dataloader:
-            images = batch["image"].to(accelerator.device, dtype=torch.float16)
-            captions = batch["text"]
-
+            if global_step >= MAX_STEPS:
+                break
+                
+            # Get batch data
+            images = batch["pixel_values"].to(accelerator.device, dtype=torch.float16)
+            captions = batch["input_ids"]
+            
+            # Tokenize captions
             text_inputs = tokenizer(
-                captions, max_length=77, padding="max_length", truncation=True, return_tensors="pt"
+                captions, 
+                max_length=77, 
+                padding="max_length", 
+                truncation=True, 
+                return_tensors="pt"
             ).to(accelerator.device)
-            prompt_embeds = pipe.text_encoder(text_inputs.input_ids)[0]
-
-            bsz = images.shape[0]
+            
+            # Get text embeddings
+            with torch.no_grad():
+                prompt_embeds = text_encoder(text_inputs.input_ids)[0]
+            
+            # Sample noise and timesteps
             noise = torch.randn_like(images)
-            timesteps = torch.randint(0, 1000, (bsz,), device=images.device).long()
-
+            timesteps = torch.randint(
+                0, scheduler.config.num_train_timesteps, 
+                (images.shape[0],), 
+                device=images.device
+            ).long()
+            
+            # Add noise to images
+            noisy_images = scheduler.add_noise(images, noise, timesteps)
+            
+            # Predict noise
             with accelerator.accumulate(transformer):
-                noisy = pipe.scheduler.add_noise(images, noise, timesteps)
-                model_pred = transformer(noisy, timesteps, encoder_hidden_states=prompt_embeds).sample
-                loss = torch.nn.functional.mse_loss(model_pred, noise, reduction="mean")
+                model_pred = transformer(
+                    hidden_states=noisy_images,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timesteps
+                ).sample
+                
+                # Calculate loss
+                loss = F.mse_loss(model_pred, noise, reduction="mean")
+                
+                # Backward pass
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
+            
+            # Update progress
             global_step += 1
             if accelerator.is_main_process:
                 progress_bar.update(1)
-                progress_bar.set_postfix(loss=loss.item())
-                if global_step % SAVE_STEPS == 0 or global_step == MAX_STEPS:
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"
+                })
+                
+                # Save checkpoint
+                if global_step % SAVE_STEPS == 0:
                     save_path = f"{OUTPUT_DIR}/checkpoint-{global_step}"
                     transformer.save_pretrained(save_path, safe_serialization=True)
-
-            if global_step >= MAX_STEPS:
-                break
-
+                    print(f"\nCheckpoint saved at step {global_step}")
+    
+    # Final save
     transformer.save_pretrained(OUTPUT_DIR, safe_serialization=True)
-    print("Done! LoRA saved to", OUTPUT_DIR)
+    print(f"\nTraining complete! LoRA saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
-

@@ -25,7 +25,6 @@ from transformers import AutoTokenizer
 from diffusers import (
     FluxTransformer2DModel,
     FluxPipeline,
-    FluxScheduler,
 )
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.utils import check_min_version, deprecate

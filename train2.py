@@ -177,17 +177,17 @@ def main():
         torch_dtype=torch.float16,
         device_map="auto"          # keeps most layers on GPU, spills to CPU when needed
     )
-    transformer = prepare_model_for_kbit_training(transformer)
+    # transformer = prepare_model_for_kbit_training(transformer)
 
     # LoRA
     lora_config = LoraConfig(
-    r=16,
-    lora_alpha=16,
-    init_lora_weights="gaussian",
-    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    # important: tell PEFT this is a diffusion model
-    task_type=TaskType.FEATURE_EXTRACTION,
-)
+        r=16,
+        lora_alpha=16,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        # important: tell PEFT this is a diffusion model
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
     transformer = get_peft_model(transformer, lora_config)
     transformer.print_trainable_parameters()
 

@@ -1,7 +1,7 @@
 import torch
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL
 from diffusers import DDPMScheduler
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
 import os
 import json
 from accelerate import Accelerator
@@ -25,7 +25,9 @@ accelerator = Accelerator()
 # Load models and components
 print("Loading models...")
 tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME, subfolder="tokenizer")
+# For SDXL, we need two text encoders
 text_encoder = CLIPTextModel.from_pretrained(MODEL_NAME, subfolder="text_encoder")
+text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(MODEL_NAME, subfolder="text_encoder_2")
 vae = AutoencoderKL.from_pretrained(MODEL_NAME, subfolder="vae")
 unet = UNet2DConditionModel.from_pretrained(MODEL_NAME, subfolder="unet")
 noise_scheduler = DDPMScheduler.from_pretrained(MODEL_NAME, subfolder="scheduler")
@@ -33,6 +35,7 @@ noise_scheduler = DDPMScheduler.from_pretrained(MODEL_NAME, subfolder="scheduler
 # Freeze models except for LoRA parameters
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
+text_encoder_2.requires_grad_(False)
 
 # Add LoRA layers to UNet using PEFT library
 from peft import LoraConfig, get_peft_model
@@ -134,6 +137,7 @@ unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_d
 # Move VAE and text_encoder to accelerator device
 vae.to(accelerator.device)
 text_encoder.to(accelerator.device)
+text_encoder_2.to(accelerator.device)
 
 # Training loop
 print("Starting training...")
@@ -158,10 +162,15 @@ for epoch in range(NUM_EPOCHS):
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (BATCH_SIZE,), device=latents.device)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Get text embeddings for SDXL (both hidden states and pooled output)
-        text_encoder_output = text_encoder(input_ids)
-        encoder_hidden_states = text_encoder_output[0]
-        pooled_text_embeds = text_encoder_output.pooler_output if hasattr(text_encoder_output, 'pooler_output') else text_encoder_output[0][:, :1, :]
+        # Get text embeddings for SDXL (both text encoders)
+        text_encoder_output = text_encoder(input_ids, output_hidden_states=True)
+        text_encoder_output_2 = text_encoder_2(input_ids, output_hidden_states=True)
+        
+        # Use the pooled output from the second text encoder
+        pooled_text_embeds = text_encoder_output_2.pooler_output
+        
+        # Get the hidden states from both encoders and concatenate them
+        encoder_hidden_states = torch.cat([text_encoder_output.hidden_states[-2], text_encoder_output_2.hidden_states[-2]], dim=-1)
 
         # Create added_cond_kwargs for SDXL
         add_time_ids = torch.tensor([RESOLUTION, RESOLUTION, 0, 0, RESOLUTION, RESOLUTION], device=latents.device)

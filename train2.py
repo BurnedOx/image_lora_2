@@ -18,7 +18,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from datasets import load_dataset
 from huggingface_hub import HfFolder
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 from PIL import Image
 from torchvision import transforms
 from transformers import (
@@ -29,7 +29,6 @@ from transformers import (
 from diffusers import FluxTransformer2DModel as DiffusersFluxTransformer2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.utils import check_min_version
-from peft import prepare_model_for_kbit_training
 
 check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)
@@ -182,11 +181,13 @@ def main():
 
     # LoRA
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
+    r=16,
+    lora_alpha=16,
+    init_lora_weights="gaussian",
+    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    # important: tell PEFT this is a diffusion model
+    task_type=TaskType.FEATURE_EXTRACTION,
+)
     transformer = get_peft_model(transformer, lora_config)
     transformer.print_trainable_parameters()
 

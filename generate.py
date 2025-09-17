@@ -1,5 +1,5 @@
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
 from peft import PeftModel
 import os
 
@@ -11,7 +11,7 @@ OUTPUT_IMAGE_PATH = "./generated_image.png"
 
 # Load base model
 print("Loading base model...")
-pipe = StableDiffusionPipeline.from_pretrained(
+pipe = StableDiffusionXLPipeline.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.float16,
     safety_checker=None,  # Disable safety checker for easier testing

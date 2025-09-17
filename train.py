@@ -166,8 +166,8 @@ for epoch in range(NUM_EPOCHS):
         text_encoder_output = text_encoder(input_ids, output_hidden_states=True)
         text_encoder_output_2 = text_encoder_2(input_ids, output_hidden_states=True)
         
-        # Use the pooled output from the second text encoder
-        pooled_text_embeds = text_encoder_output_2.pooler_output
+        # Use the text_embeds from the second text encoder (CLIPTextModelWithProjection)
+        pooled_text_embeds = text_encoder_output_2.text_embeds
         
         # Get the hidden states from both encoders and concatenate them
         encoder_hidden_states = torch.cat([text_encoder_output.hidden_states[-2], text_encoder_output_2.hidden_states[-2]], dim=-1)

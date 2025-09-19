@@ -14,9 +14,9 @@ from tqdm.auto import tqdm
 MODEL_NAME = "runwayml/stable-diffusion-v1-5"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
-BATCH_SIZE = 1
-NUM_EPOCHS = 100  # Reduced from 1000 to prevent overfitting
-LEARNING_RATE = 1e-5  # Reduced learning rate for stable training
+BATCH_SIZE = 2  # Increased from 1 for better gradient stability
+NUM_EPOCHS = 100
+LEARNING_RATE = 5e-6  # Further reduced learning rate for small batch
 RESOLUTION = 512
 
 # Initialize accelerator
@@ -97,7 +97,7 @@ class ImageCaptionDataset(Dataset):
                 "input_ids": input_ids
             }
         except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
+            print(f"ERROR: Failed to load image {image_path}: {e}")
             # Return a dummy tensor to avoid breaking the batch
             dummy_image = torch.zeros((3, self.resolution, self.resolution))
             dummy_input_ids = torch.zeros((self.tokenizer.model_max_length,), dtype=torch.long)

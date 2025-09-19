@@ -15,8 +15,8 @@ MODEL_NAME = "runwayml/stable-diffusion-v1-5"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
 BATCH_SIZE = 1
-NUM_EPOCHS = 1000
-LEARNING_RATE = 1e-4
+NUM_EPOCHS = 100  # Reduced from 1000 to prevent overfitting
+LEARNING_RATE = 1e-5  # Reduced learning rate for stable training
 RESOLUTION = 512
 
 # Initialize accelerator
@@ -38,9 +38,9 @@ text_encoder.requires_grad_(False)
 from peft import LoraConfig, get_peft_model
 
 lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+    r=8,  # Reduced rank to prevent overfitting
+    lora_alpha=16,  # Adjusted alpha for better balance
+    target_modules=["to_q", "to_k", "to_v", "to_out.0", "proj_in", "proj_out"],
     lora_dropout=0.1,
 )
 unet = get_peft_model(unet, lora_config)
@@ -135,9 +135,12 @@ unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_d
 vae.to(accelerator.device)
 text_encoder.to(accelerator.device)
 
-# Training loop
+# Training loop with validation and early stopping
 print("Starting training...")
 global_step = 0
+best_loss = float('inf')
+patience = 5
+patience_counter = 0
 
 for epoch in range(NUM_EPOCHS):
     unet.train()
@@ -168,13 +171,32 @@ for epoch in range(NUM_EPOCHS):
         loss = torch.nn.functional.mse_loss(noise_pred, noise)
         accelerator.backward(loss)
         
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
+        
         optimizer.step()
         optimizer.zero_grad()
         
         train_loss += loss.item()
         global_step += 1
 
-    print(f"Epoch {epoch} - Average Loss: {train_loss / len(train_dataloader):.4f}")
+    avg_loss = train_loss / len(train_dataloader)
+    print(f"Epoch {epoch} - Average Loss: {avg_loss:.4f}")
+    
+    # Early stopping check
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        patience_counter = 0
+        # Save best model
+        unet.save_pretrained(OUTPUT_DIR)
+        print(f"New best model saved with loss: {best_loss:.4f}")
+    else:
+        patience_counter += 1
+        print(f"Loss not improved. Patience: {patience_counter}/{patience}")
+        
+    if patience_counter >= patience:
+        print(f"Early stopping triggered after {epoch} epochs")
+        break
 
 # Save LoRA weights using PEFT
 print("Saving model...")

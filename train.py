@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 MODEL_NAME = "runwayml/stable-diffusion-v1-5"
 TRIGGER_WORD = "mamaplugxs"
 OUTPUT_DIR = "./lora_finetuned_model"
-BATCH_SIZE = 2  # Increased from 1 for better gradient stability
+BATCH_SIZE = 1  # Increased from 1 for better gradient stability
 NUM_EPOCHS = 100
 LEARNING_RATE = 5e-6  # Further reduced learning rate for small batch
 RESOLUTION = 512

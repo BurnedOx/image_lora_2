@@ -33,9 +33,7 @@ except Exception as e:
 
 # Generate multiple images with different prompts and parameters
 prompts = [
-    f"{TRIGGER_WORD} a beautiful portrait, high quality, detailed",
-    f"{TRIGGER_WORD} smiling, professional photo, sharp focus",
-    f"{TRIGGER_WORD} in elegant dress, cinematic lighting"
+    f"a photo of {TRIGGER_WORD} sitting on a beach during sunset",
 ]
 
 for i, prompt in enumerate(prompts):

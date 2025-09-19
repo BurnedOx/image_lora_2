@@ -1,2 +1,5 @@
-offload/
+vanv
+env
+lora_finetuned_model
+generated_images
 __pycache__
